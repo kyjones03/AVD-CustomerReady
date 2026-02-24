@@ -64,9 +64,11 @@ The script will:
 │   ├── domain.bicep               # Domain controller (conditional)
 │   ├── bastion.bicep              # Azure Bastion Developer SKU (conditional)
 │   └── roleassignment.bicep       # AVD service principal role assignments
+├── imageCapture/
+│   └── imagecapture.ps1           # Image capture & gallery versioning workflow
 ├── Deploy-AVD.ps1                 # Interactive PowerShell deployment wrapper
-├── README.md                      # This file
-└── Images/
+├── .gitignore
+└── README.md                      # This file
 ```
 
 ---
@@ -192,6 +194,8 @@ Override any default with `--parameters key=value`. See `avdParams.bicepparam` f
 | Storage Account | `sa{uniqueString}` | `sa2hfx7...` |
 | Key Vault | `kv{uniqueString}` | `kv2hfx7...` |
 | Compute Gallery | `acgavdpoc` | `acgavdpoc` |
+| Log Analytics | `la{uniqueString}` | `la2hfx7...` |
+| Public IP | `pip{uniqueString}` | `pip2hfx7...` |
 | VM | `avdtemplate01` | `avdtemplate01` |
 
 Names requiring global uniqueness use `uniqueString()` to avoid collisions.
@@ -200,7 +204,7 @@ Names requiring global uniqueness use `uniqueString()` to avoid collisions.
 
 ## Future Enhancements (Out of Scope for V1)
 
-- Image capturing flow with Azure Compute Gallery with regional image replication
+- Image capturing with regional image replication via Azure Compute Gallery
 - Automated session host provisioning from golden image with AD and Entra ID join capabilities
 - Private endpoints for Storage & Key Vault
 - Scaling plan schedule configurations
