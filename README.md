@@ -211,3 +211,9 @@ Names requiring global uniqueness use `uniqueString()` to avoid collisions.
 - Azure Policy assignments
 - CI/CD pipeline (GitHub Actions)
 
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
