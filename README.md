@@ -26,7 +26,8 @@ An interactive, IaC-driven solution to deploy a **customer-ready Azure Virtual D
 | Azure CLI | 2.50+ |
 | Bicep CLI | 0.20+ (auto-installed if missing) |
 | PowerShell | 7.x recommended; 5.1 supported |
-| Azure Subscription | Contributor role at subscription scope |
+| Azure Subscription | Contributor role at subscription scope for resource deployment |
+| Azure Subscription | Owner, Role-Based Access Administrator, User Access Administrator at Subscription or Resource Group scope for AVD service principal role assignment |
 | Azure AD | Permissions to register apps (if using AAD Kerberos for storage) |
 
 ---
