@@ -46,6 +46,87 @@ function Read-PromptWithDefault {
     return $value
 }
 
+function Format-IsoDuration {
+    # Converts an ISO 8601 duration string (e.g. "PT1M48.5S") returned by the ARM
+    # operations API into a human-readable mm:ss string.
+    param([string]$IsoDuration)
+    try {
+        $ts = [System.Xml.XmlConvert]::ToTimeSpan($IsoDuration)
+        return '{0:mm\:ss}' -f $ts
+    }
+    catch {
+        return $IsoDuration
+    }
+}
+
+function Invoke-VMQuotaCheck {
+    <#
+    .SYNOPSIS
+        Looks up the quota family for a VM size and checks available vCPU quota.
+    .OUTPUTS
+        Hashtable: Checked, Sufficient, Available, Needed, Family, WarningMessage
+    #>
+    param(
+        [string]$VmSize,
+        [string]$Location,
+        [string]$CsvPath
+    )
+
+    $result = @{
+        Checked        = $false
+        Sufficient     = $true   # default safe — non-fatal if CSV miss
+        Available      = 0
+        Needed         = 0
+        Family         = ''
+        WarningMessage = ''
+    }
+
+    # -- CSV lookup --
+    if (-not (Test-Path $CsvPath)) {
+        $result.WarningMessage = "Size map CSV not found at '$CsvPath' — quota check skipped."
+        return $result
+    }
+
+    $rows = Get-Content $CsvPath |
+        Where-Object { $_ -notmatch '^\s*#' -and $_ -notmatch '^\s*$' } |
+        ConvertFrom-Csv
+
+    $entry = $rows | Where-Object { $_.Size -ieq $VmSize } | Select-Object -First 1
+
+    if (-not $entry) {
+        $result.WarningMessage = "'$VmSize' not found in size map — quota check skipped. Verify manually if needed."
+        return $result
+    }
+
+    $result.Checked = $true
+    $result.Family  = $entry.Family
+    $result.Needed  = [int]$entry.vCPUs
+
+    # -- Live quota query --
+    try {
+        $usageJson = az vm list-usage `
+            --location $Location `
+            --query "[?name.value=='$($entry.Family)']" `
+            --output json 2>$null
+
+        if (-not $usageJson -or $usageJson -eq '[]') {
+            $result.WarningMessage = "No quota entry for family '$($entry.Family)' in '$Location' — check skipped."
+            $result.Checked = $false
+            return $result
+        }
+
+        $usageEntry      = $usageJson | ConvertFrom-Json | Select-Object -First 1
+        $result.Available = [int]$usageEntry.limit - [int]$usageEntry.currentValue
+        $result.Sufficient = ($result.Available -ge $result.Needed)
+    }
+    catch {
+        $result.WarningMessage = "Quota query failed: $($_.Exception.Message) — check skipped."
+        $result.Checked = $false
+    }
+
+    return $result
+}
+
 function Read-YesNo {
     param(
         [string]$Prompt,
@@ -298,6 +379,9 @@ function Get-DeploymentParameters {
         "Pooled    (Shared desktops)"
     ) 1
     $params.hostPoolType          = if ($poolTypeChoice -eq 1) { 'Personal' } else { 'Pooled' }
+    # SKU recommendation tracks pool type: personal desktops use the enterprise image,
+    # pooled desktops use the multi-session AVD-optimised image.
+    $recommendedSku = if ($params.hostPoolType -eq 'Personal') { 'win11-24h2-ent' } else { 'win11-24h2-avd' }
     $params.hostPoolName          = Read-PromptWithDefault "Host pool name" "hp-avd-poc"
     $params.appGroupName          = Read-PromptWithDefault "Application group name" "ag-avd-poc"
     $params.workspaceName         = Read-PromptWithDefault "Workspace name" "ws-avd-poc"
@@ -335,26 +419,76 @@ function Get-DeploymentParameters {
                 --query "[].name" -o json 2>$null | ConvertFrom-Json)
 
             if ($skus -and $skus.Count -gt 0) {
-                Write-Host "`nAvailable SKUs:"
+                # Find the 1-based index of the recommended SKU; fall back to 1 if not listed.
+                $recommendedSkuIdx = '1'
                 for ($i = 0; $i -lt $skus.Count; $i++) {
-                    Write-Host "  [$($i + 1)] $($skus[$i])"
+                    if ($skus[$i] -eq $recommendedSku) { $recommendedSkuIdx = ($i + 1).ToString(); break }
                 }
-                $skuIdx           = Read-PromptWithDefault "`nSelect SKU (number)" "1"
+                Write-Host "`nAvailable SKUs:  (* = recommended for $($params.hostPoolType))"
+                for ($i = 0; $i -lt $skus.Count; $i++) {
+                    $marker = if ($skus[$i] -eq $recommendedSku) { ' *' } else { '' }
+                    Write-Host "  [$($i + 1)] $($skus[$i])$marker"
+                }
+                $skuIdx           = Read-PromptWithDefault "`nSelect SKU (number)" $recommendedSkuIdx
                 $params.vmImageSku = $skus[[int]$skuIdx - 1]
             }
             else {
-                $params.vmImageSku = Read-PromptWithDefault "Image SKU" "win11-23h2-ent"
+                $params.vmImageSku = Read-PromptWithDefault "Image SKU" $recommendedSku
             }
         }
         else {
             Write-Host "  Could not fetch image list. Using defaults." -ForegroundColor Yellow
             $params.vmImageOffer = Read-PromptWithDefault "Image offer" "windows-11"
-            $params.vmImageSku   = Read-PromptWithDefault "Image SKU" "win11-23h2-ent"
+            $params.vmImageSku   = Read-PromptWithDefault "Image SKU" $recommendedSku
         }
         $params.vmImagePublisher = 'MicrosoftWindowsDesktop'
         $params.vmName           = Read-PromptWithDefault "Template VM name" "avdtemplate01"
-        $params.vmSize           = Read-PromptWithDefault "VM size" "Standard_D4s_v5"
-        $params.vmAdminUsername   = Read-PromptWithDefault "VM admin username" "avdadmin"
+
+        # -- VM size + quota check loop --
+        $quotaCsvPath = Join-Path $scriptDir "VMSizes\VM_Size_Family.csv"
+        $quotaResult  = $null
+        do {
+            $params.vmSize = Read-PromptWithDefault "VM size" "Standard_D4s_v5"
+
+            Write-Host "  Checking quota for '$($params.vmSize)' in '$($params.location)'..." -ForegroundColor Yellow
+            $quotaResult = Invoke-VMQuotaCheck -VmSize $params.vmSize -Location $params.location -CsvPath $quotaCsvPath
+
+            if (-not $quotaResult.Checked) {
+                # CSV miss or API failure — advisory only, not a hard gate
+                Write-Host "  NOTE: $($quotaResult.WarningMessage)" -ForegroundColor Yellow
+                break
+            }
+
+            if ($quotaResult.Sufficient) {
+                Write-Host "  Quota OK — $($quotaResult.Available) vCPUs available, $($quotaResult.Needed) needed ($($quotaResult.Family))." -ForegroundColor Green
+                break
+            }
+
+            # Insufficient quota — present options
+            Write-Host ""
+            Write-Host "  INSUFFICIENT QUOTA" -ForegroundColor Red
+            Write-Host "  Family    : $($quotaResult.Family)" -ForegroundColor Red
+            Write-Host "  Available : $($quotaResult.Available) vCPUs" -ForegroundColor Red
+            Write-Host "  Needed    : $($quotaResult.Needed) vCPUs" -ForegroundColor Red
+            Write-Host ""
+            $quotaChoice = Read-Selection "How would you like to proceed?" @(
+                "Choose a different VM size"
+                "Proceed anyway  (I will request a quota increase)"
+                "Exit"
+            ) 1
+            if ($quotaChoice -eq 2) {
+                Write-Host "  Proceeding with insufficient quota at user request." -ForegroundColor Yellow
+                break
+            }
+            if ($quotaChoice -eq 3) {
+                Write-Host "Deployment cancelled." -ForegroundColor Yellow
+                exit 0
+            }
+            # choice 1 — loop back to re-prompt
+        } while (-not $quotaResult.Sufficient)
+
+        $params.quotaResult      = $quotaResult
+        $params.vmAdminUsername  = Read-PromptWithDefault "VM admin username" "avdadmin"
         $params.enableTrustedLaunch = Read-YesNo "Enable Trusted Launch (Secure Boot + vTPM)?" $true
     }
     else {
@@ -362,7 +496,7 @@ function Get-DeploymentParameters {
         # Set defaults so Bicep params are satisfied (VM won't be deployed)
         $params.vmImagePublisher = 'MicrosoftWindowsDesktop'
         $params.vmImageOffer     = 'windows-11'
-        $params.vmImageSku       = 'win11-23h2-ent'
+        $params.vmImageSku       = $recommendedSku
         $params.vmName           = 'avdtemplate01'
         $params.vmSize           = 'Standard_D4s_v5'
         $params.vmAdminUsername   = 'avdadmin'
@@ -519,6 +653,34 @@ function Get-DeploymentParameters {
 
     $params.deployBastion = Read-YesNo "Deploy Azure Bastion (Developer SKU)?" $false
 
+    # -- Private Endpoints --
+    Write-Host ""
+    $params.deployPrivateEndpoints = Read-YesNo "Deploy Private Endpoints for Key Vault and FSLogix Storage?" $false
+    if ($params.deployPrivateEndpoints) {
+        Write-Host ""
+        Write-Host "  Private endpoints will:" -ForegroundColor Yellow
+        Write-Host "    - Add a dedicated PE subnet to the VNet" -ForegroundColor Yellow
+        Write-Host "    - Lock Key Vault and Storage to deny all public network access" -ForegroundColor Yellow
+        Write-Host "    - Create private DNS zones for vaultcore and file sub-resources" -ForegroundColor Yellow
+        Write-Host ""
+        if ($params.deployNetworking) {
+            $params.peSubnetName       = Read-PromptWithDefault "PE subnet name" "snet-pe-poc"
+            $params.peSubnetPrefix     = Read-PromptWithDefault "PE subnet prefix" "10.0.1.0/24"
+            $params.existingPeSubnetId = ''
+        }
+        else {
+            Write-Host "  Brownfield: provide the existing subnet resource ID for private endpoints."
+            $params.existingPeSubnetId = Read-Host "  Existing PE subnet resource ID"
+            $params.peSubnetName       = 'snet-pe-poc'
+            $params.peSubnetPrefix     = '10.0.1.0/24'
+        }
+    }
+    else {
+        $params.peSubnetName        = 'snet-pe-poc'
+        $params.peSubnetPrefix      = '10.0.1.0/24'
+        $params.existingPeSubnetId  = ''
+    }
+
     # Carry forward context
     $params.currentUserObjectId = $Context.CurrentUserObjectId
 
@@ -541,11 +703,22 @@ function Start-AVDDeployment {
     Write-Host "  Monitor RG:         $($Params.monitorRgName)"
     Write-Host "  Host Pool:          $($Params.hostPoolName) ($($Params.hostPoolType))"
     Write-Host "  Template VM:        $(if ($Params.deployTemplateVm) { "$($Params.vmSize) - $($Params.vmImageOffer)/$($Params.vmImageSku)" } else { 'Skipped (existing)' })"
+    if ($Params.deployTemplateVm -and $Params.quotaResult) {
+        $qr = $Params.quotaResult
+        if (-not $qr.Checked) {
+            Write-Host "  VM Quota:           [SKIPPED — $($qr.WarningMessage)]" -ForegroundColor Yellow
+        } elseif ($qr.Sufficient) {
+            Write-Host "  VM Quota:           $($qr.Family) — $($qr.Available) available / $($qr.Needed) needed  OK" -ForegroundColor Green
+        } else {
+            Write-Host "  VM Quota:           $($qr.Family) — $($qr.Available) available / $($qr.Needed) needed  [WARNING — proceeding at user request]" -ForegroundColor Yellow
+        }
+    }
     Write-Host "  Storage:            $(if ($Params.deployStorage) { 'New' } else { "Existing ($($Params.existingStorageAccountName))" })"
     Write-Host "  Key Vault:          $(if ($Params.deployKeyVault) { 'New' } else { "Existing ($($Params.existingKeyVaultName))" })"
     Write-Host "  Trusted Launch:     $($Params.enableTrustedLaunch)"
     Write-Host "  Domain Controller:  $($Params.deployDomain)"
     Write-Host "  Azure Bastion:      $($Params.deployBastion)"
+    Write-Host "  Private Endpoints:  $($Params.deployPrivateEndpoints)"
     Write-Host ""
 
     $confirm = Read-YesNo "Proceed with deployment?" $true
@@ -587,6 +760,7 @@ function Start-AVDDeployment {
         "deployTemplateVm=$($Params.deployTemplateVm.ToString().ToLower())"
         "deployDomain=$($Params.deployDomain.ToString().ToLower())"
         "deployBastion=$($Params.deployBastion.ToString().ToLower())"
+        "deployPrivateEndpoints=$($Params.deployPrivateEndpoints.ToString().ToLower())"
     )
 
     # Conditional parameters
@@ -613,6 +787,11 @@ function Start-AVDDeployment {
     if ($Params.dnsServers -and $Params.dnsServers.Count -gt 0) {
         $dnsJson = $Params.dnsServers | ConvertTo-Json -Compress
         $azParams += "dnsServers=$dnsJson"
+    }
+    if ($Params.deployPrivateEndpoints) {
+        if ($Params.peSubnetName)       { $azParams += "peSubnetName=$($Params.peSubnetName)" }
+        if ($Params.peSubnetPrefix)     { $azParams += "peSubnetPrefix=$($Params.peSubnetPrefix)" }
+        if ($Params.existingPeSubnetId) { $azParams += "existingPeSubnetId=$($Params.existingPeSubnetId)" }
     }
 
     # Build --parameters arguments
@@ -742,9 +921,14 @@ function Watch-DeploymentProgress {
 
             $opState = $op.properties.provisioningState
             $opDuration = '-'
-            if ($op.properties.timestamp) {
-                $opTimestamp = [DateTime]::Parse($op.properties.timestamp)
-                $opElapsed = $opTimestamp - $startTime
+            if ($op.properties.duration) {
+                # Completed operation — ARM reports the true wall-clock duration as ISO 8601
+                $opDuration = Format-IsoDuration $op.properties.duration
+            }
+            elseif ($op.properties.timestamp) {
+                # In-progress — timestamp is when the op was accepted; show live elapsed
+                $opStart   = [DateTime]::Parse($op.properties.timestamp).ToUniversalTime()
+                $opElapsed = (Get-Date).ToUniversalTime() - $opStart
                 if ($opElapsed.TotalSeconds -gt 0) {
                     $opDuration = '{0:mm\:ss}' -f $opElapsed
                 }
@@ -854,6 +1038,12 @@ function Show-DeploymentSummary {
         elseif ($DeploymentResult.Params.existingStorageAccountName) {
             Write-Host "`n  Storage (existing):" -ForegroundColor White
             Write-Host "    Account: $($DeploymentResult.Params.existingStorageAccountName)  (RG: $($DeploymentResult.Params.existingStorageAccountRg))"
+        }
+
+        if ($outputs.privateEndpointsDeployed -and $outputs.privateEndpointsDeployed.value -eq $true) {
+            Write-Host "`n  Private Endpoints:" -ForegroundColor White
+            Write-Host "    Key Vault and FSLogix Storage are network-isolated."
+            Write-Host "    DNS: privatelink.vaultcore.azure.net / privatelink.file.core.windows.net"
         }
     }
 
