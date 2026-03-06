@@ -1,2 +1,5 @@
 clicommands.ps1
 Specifications/
+*.code-workspace
+quota.json
+.vscode/
