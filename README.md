@@ -10,12 +10,14 @@ An interactive, IaC-driven solution to deploy a **customer-ready Azure Virtual D
 
 - **Interactive deployment** — guided PowerShell experience with sensible defaults
 - **Greenfield & Brownfield** — deploy everything from scratch or leverage existing VNet / Key Vault / Storage / Log Analytics
-- **Live progress tracking** — real-time status table showing each resource deployment as it completes
+- **Live progress tracking** — real-time status table with accurate per-operation durations sourced directly from the ARM operations API
 - **Modular Bicep templates** — clean, subscription-scoped infrastructure as code
 - **Scaling plan** — auto-created and linked to the host pool (Personal or Pooled)
 - **Security-first** — Key Vault integration, Trusted Launch, RBAC authorization, no secrets in source
+- **Private endpoints** — optional network isolation for Key Vault and FSLogix Storage Account with private DNS auto-registration
 - **Bastion-aware** — skips public IP and uses blank NSG when Bastion is enabled
-- **Image picker** — dynamically lists available Windows 11 offers and SKUs from your region
+- **Image picker** — dynamically lists available Windows 11 offers and SKUs from your region; default SKU is automatically matched to pool type (`win11-24h2-ent` for Personal, `win11-24h2-avd` for Pooled)
+- **Quota pre-flight** — checks available vCPU quota for the chosen VM size before deployment starts, with an interactive retry loop if quota is insufficient
 
 ---
 
@@ -27,8 +29,45 @@ An interactive, IaC-driven solution to deploy a **customer-ready Azure Virtual D
 | Bicep CLI | 0.20+ (auto-installed if missing) |
 | PowerShell | 7.x recommended; 5.1 supported |
 | Azure Subscription | Contributor role at subscription scope for resource deployment |
-| Azure Subscription | Owner, Role-Based Access Administrator, User Access Administrator at Subscription or Resource Group scope for AVD service principal role assignment |
+| Azure Subscription | Owner, Role-Based Access Administrator, or User Access Administrator at subscription or resource group scope for AVD service principal role assignment |
 | Azure AD | Permissions to register apps (if using AAD Kerberos for storage) |
+
+### Required Resource Providers
+
+The following resource providers must be registered on the target subscription before deployment. Unregistered providers will cause ARM to reject individual module deployments mid-run.
+
+| Provider | Used For |
+|---|---|
+| `Microsoft.DesktopVirtualization` | Host pools, application groups, workspaces, scaling plans |
+| `Microsoft.Compute` | Virtual machines, Azure Compute Gallery, VM extensions |
+| `Microsoft.Network` | VNet, subnets, NSG, NICs, Public IPs, Bastion, Private Endpoints |
+| `Microsoft.KeyVault` | Key Vault and secrets |
+| `Microsoft.Storage` | Storage Account for FSLogix profile shares |
+| `Microsoft.OperationalInsights` | Log Analytics Workspace |
+| `Microsoft.Insights` | Data Collection Rules and DCR associations |
+| `Microsoft.Authorization` | RBAC role assignments |
+| `Microsoft.Quota` | Enables quota querying capabilities  |
+
+To register all providers in one step:
+
+```powershell
+$providers = @(
+    'Microsoft.DesktopVirtualization',
+    'Microsoft.Compute',
+    'Microsoft.Network',
+    'Microsoft.KeyVault',
+    'Microsoft.Storage',
+    'Microsoft.OperationalInsights',
+    'Microsoft.Insights',
+    'Microsoft.Authorization'
+)
+foreach ($rp in $providers) {
+    az provider register --namespace $rp --wait
+    Write-Host "Registered $rp" -ForegroundColor Green
+}
+```
+
+> **Note:** Provider registration is idempotent — re-running against an already-registered provider is safe. Registration typically takes 1–3 minutes per provider.
 
 ---
 
@@ -60,13 +99,17 @@ The script will:
 ├── avdMain.bicep                  # Orchestrator — subscription scope
 ├── avdParams.bicepparam           # Default parameter values (reference only)
 ├── modules/
-│   ├── networking.bicep           # VNet, Subnets, NSG (blank when Bastion enabled)
-│   ├── keyvault.bicep             # Key Vault + secrets + RBAC
+│   ├── networking.bicep           # VNet, Subnets (AVD + PE), NSG
+│   ├── keyvault.bicep             # Key Vault + secrets + RBAC + optional network ACLs
 │   ├── avdcore.bicep              # Host pool, scaling plan, app group, workspace, storage, gallery, VM
 │   ├── monitor.bicep              # Log Analytics + Data Collection Rule
 │   ├── domain.bicep               # Domain controller (conditional)
 │   ├── bastion.bicep              # Azure Bastion Developer SKU (conditional)
-│   └── roleassignment.bicep       # AVD service principal role assignments
+│   ├── roleassignment.bicep       # AVD service principal role assignments
+│   └── privateendpoints.bicep     # Private DNS zones, VNet links, PEs for KV + Storage (conditional)
+├── VMSizes/
+│   ├── VM_Size_Family.csv         # ARM size → quota family + vCPU count mapping (General Compute D-series)
+│   └── Test-VMQuota.ps1           # Standalone quota check script for ad-hoc validation
 ├── imageCapture/
 │   └── imagecapture.ps1           # Image capture & gallery versioning workflow
 ├── Deploy-AVD.ps1                 # Interactive PowerShell deployment wrapper
@@ -83,7 +126,7 @@ The script will:
 All resources are created from scratch:
 
 - 3 Resource Groups (core, networking, monitoring)
-- Virtual Network, Subnet, NSG
+- Virtual Network, AVD Subnet, NSG
 - Key Vault with VM admin secret
 - AVD Host Pool, Scaling Plan, Application Group, Workspace
 - Storage Account with FSLogix profile share
@@ -93,6 +136,7 @@ All resources are created from scratch:
 - Role Assignments (Power On Contributor + Power On Off Contributor)
 - *(Optional)* Domain Controller VM
 - *(Optional)* Azure Bastion (Developer SKU — skips PIP, uses blank NSG)
+- *(Optional)* Private Endpoints for Key Vault and FSLogix Storage (dedicated PE subnet, private DNS zones)
 
 ### Brownfield — Leverage Existing Infrastructure
 
@@ -117,7 +161,8 @@ When existing resources are provided, the corresponding Bicep module is skipped.
 |---|---|---|
 | Resource Groups (3) | `avdMain.bicep` | Always (idempotent) |
 | Role Assignments (2) | `roleassignment.bicep` | Always (before AVD core) |
-| NSG, VNet, Subnet | `networking.bicep` | Greenfield only |
+| NSG, VNet, AVD Subnet | `networking.bicep` | Greenfield only |
+| PE Subnet | `networking.bicep` | When private endpoints enabled |
 | Key Vault + Secret | `keyvault.bicep` | Greenfield only |
 | Host Pool + Scaling Plan | `avdcore.bicep` | Always |
 | Application Group + Workspace | `avdcore.bicep` | Always |
@@ -129,36 +174,92 @@ When existing resources are provided, the corresponding Bicep module is skipped.
 | Data Collection Rule | `monitor.bicep` | Optional |
 | Domain Controller VM | `domain.bicep` | Optional |
 | Azure Bastion | `bastion.bicep` | Optional |
+| Private DNS Zones + VNet Links | `privateendpoints.bicep` | When private endpoints enabled |
+| Private Endpoints (KV + Storage) | `privateendpoints.bicep` | When private endpoints enabled |
 
 ---
 
 ## Live Deployment Progress
 
-The deployment runs asynchronously and displays a live-updating status table:
+The deployment runs asynchronously and displays a live-updating status table. Duration values for completed operations are sourced from the ARM operations API (`properties.duration`) — the same timestamps shown in the Azure portal. In-progress operations show a live elapsed counter.
 
 ```
-  Deployment: avd-poc-20260210-180130    [Running - 02:15]
+  Deployment: avd-poc-20260305-152207    [Succeeded - 03:33]
 
   Operation                                Status          Duration
   ──────────────────────────────────────────────────────────────────────
-  rg-avd-core-poc                          Succeeded       00:12
-  rg-avd-network-poc                       Succeeded       00:08
-  roleAssignmentDeployment                 Succeeded       00:25
-  networkingDeployment                     Succeeded       01:02
-  keyVaultDeployment                       Running         01:45
-  avdCoreDeployment                        Accepted        —
+  rg-avd-core-poc                          Succeeded       -
+  rg-avd-network-poc                       Succeeded       -
+  roleAssignmentDeployment                 Succeeded       00:00
+  networkingDeployment                     Succeeded       00:27
+  keyVaultDeployment                       Succeeded       00:27
+  avdCoreDeployment                        Succeeded       01:48
+  privateEndpointsDeployment               Succeeded       02:15
 ```
 
-Statuses are color-coded: **green** = Succeeded, **cyan** = Running, **red** = Failed.
+Statuses are color-coded: **green** = Succeeded, **cyan** = Running/Accepted, **red** = Failed.
 
 ---
 
-## Security
+When selecting the template VM image, the recommended SKU is automatically matched to the host pool type chosen earlier in the flow:
+
+| Host Pool Type | Recommended SKU | Notes |
+|---|---|---|
+| Personal | `win11-24h2-ent` | Single-session Windows 11 Enterprise |
+| Pooled | `win11-24h2-avd` | Multi-session Windows 11 Enterprise for AVD |
+
+The recommended SKU is pre-selected as the default in the SKU list and marked with `*`. Any other SKU in the list can still be chosen.
+
+---
+
+## VM Quota Pre-flight Check
+
+After the VM size is entered, the deployment script automatically checks whether sufficient vCPU quota is available in the target region before proceeding.
+
+### How it works
+
+1. The chosen VM size is looked up in `VMSizes/VM_Size_Family.csv` to resolve its quota family name and vCPU requirement.
+2. `az vm list-usage` is queried for that family in the selected region.
+3. Available vCPUs (limit − current usage) are compared against the requirement.
+
+### Outcomes
+
+| Result | Behaviour |
+|---|---|
+| Sufficient quota | Green confirmation line; continues to next prompt |
+| Insufficient quota | Shows family / available / needed in red; offers: choose different size, proceed anyway, or exit |
+| Size not in CSV | Advisory warning only — continues (non-blocking; useful for B-series, L-series, custom sizes) |
+| API / CLI error | Advisory warning only — continues |
+
+The quota result is echoed in the pre-deployment summary so the operator has a clear record before confirming.
+
+### Standalone test script
+
+`VMSizes/Test-VMQuota.ps1` can be used independently for ad-hoc checks without running a full deployment:
+
+```powershell
+# Check a specific size in a region
+.\VMSizes\Test-VMQuota.ps1 -VmSize Standard_D4s_v5 -Location eastus2
+
+# Check if enough quota exists for two VMs of the same size
+.\VMSizes\Test-VMQuota.ps1 -VmSize Standard_D8s_v5 -Location eastus2 -RequiredVcpus 16
+```
+
+Exit codes: `0` = sufficient, `1` = CSV miss or CLI error, `2` = quota too low.
+
+### Extending the size map
+
+`VMSizes/VM_Size_Family.csv` currently covers all General Compute D-series families (Dv2 through Dv5, AMD, Arm/Ampere, and Confidential variants). To add additional families (E-series, B-series, etc.), append rows following the same `Size,Family,vCPUs` format. Lines beginning with `#` are treated as comments.
+
+---
+
+## Image SKU Defaults
 
 | Practice | Detail |
 |---|---|
 | **No secrets in source** | Admin passwords collected via `Read-Host -AsSecureString` and passed as `@secure()` Bicep parameters |
 | **Key Vault** | Stores VM admin password; RBAC authorization enabled; soft delete with 90-day retention |
+| **Private endpoints** | Optional: Key Vault and FSLogix Storage network-isolated with `defaultAction: Deny` + private DNS zones (`privatelink.vaultcore.azure.net`, `privatelink.file.core.windows.net`) |
 | **Trusted Launch** | Secure Boot + vTPM enabled by default on all VMs |
 | **NSG** | Default allows RDP from `*` (warns operator); blank NSG when Bastion is enabled |
 | **No Public IP with Bastion** | Template VM skips public IP when Bastion provides secure access |
@@ -205,14 +306,14 @@ Names requiring global uniqueness use `uniqueString()` to avoid collisions.
 
 ---
 
-## Future Enhancements (Out of Scope for V1)
+## Future Enhancements
 
 - Image capturing with regional image replication via Azure Compute Gallery
 - Automated session host provisioning from golden image with AD and Entra ID join capabilities
-- Private endpoints for Storage & Key Vault
+- Storage Account AD join provisioning
 - Scaling plan schedule configurations
-- Azure Policy assignments
 - CI/CD pipeline (GitHub Actions)
+- Expand `VM_Size_Family.csv` to cover B-series, E-series, F-series, and N-series families
 
 ---
 
