@@ -25,6 +25,12 @@ param dnsServers array = []
 param existingSubnetId string = ''
 param existingVnetId string = ''
 
+// ── Private Endpoints ──
+param deployPrivateEndpoints bool = false
+param peSubnetName string = 'snet-pe-poc'
+param peSubnetPrefix string = '10.0.1.0/24'
+param existingPeSubnetId string = ''
+
 // ── Key Vault ──
 param deployKeyVault bool = true
 param keyVaultName string = ''
@@ -119,6 +125,9 @@ module networking 'modules/networking.bicep' = if (deployNetworking) {
     nsgName: nsgName
     dnsServers: dnsServers
     deployBastion: deployBastion
+    deployPrivateEndpoints: deployPrivateEndpoints
+    peSubnetName: peSubnetName
+    peSubnetPrefix: peSubnetPrefix
   }
 }
 
@@ -131,6 +140,7 @@ module keyVaultModule 'modules/keyvault.bicep' = if (deployKeyVault) {
     keyVaultName: effectiveKeyVaultName
     vmAdminPassword: vmAdminPassword
     currentUserObjectId: currentUserObjectId
+    deployPrivateEndpoints: deployPrivateEndpoints
   }
 }
 
@@ -149,6 +159,7 @@ module avdCore 'modules/avdcore.bicep' = {
     storageAccountName: effectiveStorageAccountName
     fslogixShareName: fslogixShareName
     enableAadKerberosAuth: enableAadKerberosAuth
+    deployPrivateEndpoints: deployPrivateEndpoints
     galleryName: galleryName
     deployTemplateVm: deployTemplateVm
     vmName: vmName
@@ -206,6 +217,23 @@ module bastionModule 'modules/bastion.bicep' = if (deployBastion) {
   }
 }
 
+// ── Private Endpoints — Key Vault + FSLogix Storage (optional) ──
+// Requires deployNetworking=true OR existingPeSubnetId to be supplied.
+// DNS zones and PEs are scoped to networkRg so VNet links resolve for all VMs.
+module privateEndpoints 'modules/privateendpoints.bicep' = if (deployPrivateEndpoints && deployKeyVault && deployStorage) {
+  scope: networkRg
+  name: 'privateEndpointsDeployment'
+  params: {
+    location: location
+    vnetId: deployNetworking ? networking!.outputs.vnetId : existingVnetId
+    peSubnetId: deployNetworking ? networking!.outputs.peSubnetId : existingPeSubnetId
+    kvName: keyVaultModule!.outputs.keyVaultName
+    kvId: keyVaultModule!.outputs.keyVaultId
+    storageAccountName: avdCore.outputs.storageAccountName
+    storageAccountId: avdCore.outputs.storageAccountId
+  }
+}
+
 // ── Role Assignment — AVD Power On + Power On Off Contributor ──
 module roleAssignment 'modules/roleassignment.bicep' = {
   scope: coreRg
@@ -228,3 +256,4 @@ output keyVaultUri string = deployKeyVault ? keyVaultModule!.outputs.keyVaultUri
 output keyVaultName string = deployKeyVault ? keyVaultModule!.outputs.keyVaultName : ''
 output storageAccountName string = avdCore.outputs.storageAccountName
 output galleryId string = avdCore.outputs.galleryId
+output privateEndpointsDeployed bool = deployPrivateEndpoints && deployKeyVault && deployStorage

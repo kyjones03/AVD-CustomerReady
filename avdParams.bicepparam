@@ -23,6 +23,12 @@ param dnsServers = []
 param existingSubnetId = ''
 param existingVnetId = ''
 
+// Private Endpoints — set to true to deploy PE for Key Vault and FSLogix storage
+param deployPrivateEndpoints = false
+param peSubnetName = 'snet-pe-poc'
+param peSubnetPrefix = '10.0.1.0/24'
+param existingPeSubnetId = ''
+
 // Key Vault
 param deployKeyVault = true
 param keyVaultName = ''
