@@ -14,6 +14,7 @@ An interactive, IaC-driven solution to deploy a **customer-ready Azure Virtual D
 - **Modular Bicep templates** — clean, subscription-scoped infrastructure as code
 - **Scaling plan** — auto-created and linked to the host pool (Personal or Pooled)
 - **Security-first** — Key Vault integration, Trusted Launch, RBAC authorization, no secrets in source
+- **AVD diagnostics** — diagnostic settings automatically configured on the Host Pool, Application Group, and Workspace, sending logs to the Log Analytics Workspace
 - **Private endpoints** — optional network isolation for Key Vault and FSLogix Storage Account with private DNS auto-registration
 - **Bastion-aware** — skips public IP and uses blank NSG when Bastion is enabled
 - **Image picker** — dynamically lists available Windows 11 offers and SKUs from your region; default SKU is automatically matched to pool type (`win11-24h2-ent` for Personal, `win11-24h2-avd` for Pooled)
@@ -101,7 +102,7 @@ The script will:
 ├── modules/
 │   ├── networking.bicep           # VNet, Subnets (AVD + PE), NSG
 │   ├── keyvault.bicep             # Key Vault + secrets + RBAC + optional network ACLs
-│   ├── avdcore.bicep              # Host pool, scaling plan, app group, workspace, storage, gallery, VM
+│   ├── avdcore.bicep              # Host pool, scaling plan, app group, workspace, storage, gallery, VM, diagnostic settings
 │   ├── monitor.bicep              # Log Analytics + Data Collection Rule
 │   ├── domain.bicep               # Domain controller (conditional)
 │   ├── bastion.bicep              # Azure Bastion Developer SKU (conditional)
@@ -129,6 +130,7 @@ All resources are created from scratch:
 - Virtual Network, AVD Subnet, NSG
 - Key Vault with VM admin secret
 - AVD Host Pool, Scaling Plan, Application Group, Workspace
+- Diagnostic Settings on Host Pool, Application Group, and Workspace → Log Analytics
 - Storage Account with FSLogix profile share
 - Azure Compute Gallery
 - Template VM with Public IP and NIC
@@ -148,7 +150,7 @@ You're prompted to select or enter existing:
 | Virtual Network / Subnet | Pick from list |
 | Key Vault | Pick from list |
 | Storage Account | Pick from list |
-| Log Analytics Workspace | Pick from list |
+| Log Analytics Workspace | Pick from list (resource ID resolved automatically for diagnostics) |
 | Template VM | Option to skip building a new VM |
 
 When existing resources are provided, the corresponding Bicep module is skipped. Admin passwords are stored in the selected existing Key Vault automatically.
@@ -166,6 +168,7 @@ When existing resources are provided, the corresponding Bicep module is skipped.
 | Key Vault + Secret | `keyvault.bicep` | Greenfield only |
 | Host Pool + Scaling Plan | `avdcore.bicep` | Always |
 | Application Group + Workspace | `avdcore.bicep` | Always |
+| Diagnostic Settings (Host Pool, App Group, Workspace) | `avdcore.bicep` | When a Log Analytics Workspace is available |
 | Storage Account (FSLogix) | `avdcore.bicep` | Greenfield only (skippable) |
 | Azure Compute Gallery | `avdcore.bicep` | Always |
 | Template VM + NIC | `avdcore.bicep` | Optional (skippable in brownfield) |
